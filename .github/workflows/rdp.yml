@@ -1,1 +1,156 @@
-add rdp workflow
+name: Temporary Windows RDP (Tailscale)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  temporary-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Validate required secrets
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Missing repository secret: TAILSCALE_AUTHKEY"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Missing repository secret: RDP_PASSWORD"
+          }
+
+      - name: Configure RDP securely
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Enable Remote Desktop and keep Network Level Authentication enabled.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' -Value 1 -Force
+
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+            New-LocalUser -Name 'RDP' -Password $securePassword `
+              -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name 'RDP' -Password $securePassword
+          }
+
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP' `
+            -ErrorAction SilentlyContinue
+
+          # Permit RDP only from Tailscale's CGNAT address range.
+          Get-NetFirewallRule -DisplayName 'RDP only over Tailscale' `
+            -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName 'RDP only over Tailscale' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any | Out-Null
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+      - name: Show runner specifications
+        shell: pwsh
+        run: |
+          $cpu = Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum
+          $memoryGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+          $disk = Get-Volume -DriveLetter C
+          Write-Host "Logical processors: $($cpu.Sum)"
+          Write-Host "RAM (GB): $memoryGB"
+          Write-Host "C: free space (GB): $([math]::Round($disk.SizeRemaining / 1GB, 1))"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $msi = Join-Path $env:TEMP 'tailscale-setup.msi'
+          Invoke-WebRequest `
+            -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+            -OutFile $msi
+          Start-Process msiexec.exe `
+            -ArgumentList @('/i', $msi, '/quiet', '/norestart') `
+            -Wait
+          Remove-Item $msi -Force
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale installation was not found."
+          }
+
+          & $tailscale up "--authkey=$env:TS_AUTHKEY" `
+            "--hostname=gh-win-$env:GITHUB_RUN_ID" `
+            --accept-dns=true
+
+          $ip = $null
+          for ($i = 0; $i -lt 30 -and -not $ip; $i++) {
+            Start-Sleep -Seconds 2
+            $ip = (& $tailscale ip -4 2>$null | Select-Object -First 1)
+            if ($ip) { $ip = $ip.Trim() }
+          }
+
+          if (-not $ip) {
+            throw "Tailscale did not assign an IPv4 address."
+          }
+
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale IPv4: $ip"
+
+      - name: Verify RDP service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $service = Get-Service -Name TermService
+          if ($service.Status -ne 'Running') {
+            Start-Service TermService
+          }
+
+          $result = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389
+          if (-not $result.TcpTestSucceeded) {
+            throw "RDP is not listening on TCP 3389."
+          }
+
+          Write-Host "RDP service is listening."
+          Write-Host "Connect from a device on the same Tailscale network:"
+          Write-Host "Computer: $env:TAILSCALE_IP"
+          Write-Host "Username: .\RDP"
+          Write-Host "Password: the value stored in GitHub secret RDP_PASSWORD"
+
+      - name: Keep runner available for this temporary session
+        shell: pwsh
+        run: |
+          Write-Host "Temporary runner is ready. Cancel this workflow to end the session."
+          while ($true) {
+            Start-Sleep -Seconds 240
+            Write-Host "Runner active: $(Get-Date -Format o)"
+          }
